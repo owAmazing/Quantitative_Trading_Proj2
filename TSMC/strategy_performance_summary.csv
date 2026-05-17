@@ -1,0 +1,4 @@
+,Cumulative_Return,Annualized_Return,Maximum_Drawdown,Volatility
+Buy_and_Hold_Benchmark,5064.02%,20.28%,49.33%,27.72%
+Dollar_Cost_Averaging_Benchmark,nan%,nan%,44.30%,18.18%
+MA_20_Crossover,204.81%,5.36%,68.20%,19.49%
