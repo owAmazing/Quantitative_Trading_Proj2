@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from metrics_calc import calculate_all_metrics
 
-target_stock = 'KO' 
+target_stock = 'AAPL' 
 
 file_name = f'{target_stock}_20y.csv'
 df = pd.read_csv(file_name)
@@ -127,7 +127,7 @@ for col in percent_cols:
     formatted_df[col] = formatted_df[col].map(lambda x: f"{x:.2%}")
 formatted_df["Test_MDD"] = formatted_df["Test_MDD"].map(lambda x: f"-{x:.2%}")
 
-output_file = f'{target_stock}_volatility_validation_summary.csv'
+output_file = f'{target_stock}_volatility_validation_%b_summary.csv'
 formatted_df.to_csv(output_file, index=False)
 
 print("\n" + "="*60)

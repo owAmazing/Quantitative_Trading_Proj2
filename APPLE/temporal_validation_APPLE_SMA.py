@@ -7,7 +7,7 @@ from metrics_calc import calculate_all_metrics
 # ==========================================
 # 1. 讀取並預處理台積電資料
 # ==========================================
-df = pd.read_csv('2330_TW_20y.csv')
+df = pd.read_csv('AAPL_20y.csv')
 df['Date'] = pd.to_datetime(df['Date'])
 df = df.sort_values('Date').reset_index(drop=True)
 
@@ -119,10 +119,10 @@ for col in percent_cols:
 formatted_df["Test_MDD"] = formatted_df["Test_MDD"].map(lambda x: f"-{x:.2%}")
 
 # 匯出成 CSV
-formatted_df.to_csv('temporal_validation_expanding_summary.csv', index=False)
+formatted_df.to_csv('temporal_validation_summary_AAPL_SMA.csv', index=False)
 print("\n" + "="*50)
 print("🎉 【大功告成】完整滾動時序驗證已全部執行完畢！")
-print("👉 成果報告已成功儲存至 -> 'temporal_validation_expanding_summary.csv'")
+print("👉 成果報告已成功儲存至 -> 'temporal_validation_summary_AAPL_SMA.csv'")
 print("="*50)
 
 # 在終端機印出前幾行與最後幾行給你看
