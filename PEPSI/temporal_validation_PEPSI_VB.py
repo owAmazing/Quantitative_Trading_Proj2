@@ -12,7 +12,7 @@ df = df.sort_values('Date').reset_index(drop=True)
 df['Year'] = df['Date'].dt.year
 
 initial_capital = 10000
-candidate_n = [5, 10, 20, 30, 40, 50, 60]  # 布林通道的候選天數 (計算基準)
+candidate_n = [5, 10, 20, 60, 120]   # 布林通道的候選天數 (計算基準)
 k = 2  # 標準差倍數 (固定為 2 倍標準差)
 
 validation_results = []
