@@ -14,6 +14,7 @@ def load_data():
     pep = pep[['Date', 'Close']].rename(columns={'Close': 'PEP'})
     df = pd.merge(ko, pep, on='Date', how='inner').sort_values('Date').set_index('Date')
     df = df.dropna()
+    df = df.loc[df.index >= pd.Timestamp('2005-01-01')]
     return df
 
 
@@ -65,18 +66,20 @@ def run_pair_trading(prices_a, prices_b, window=20, entry_z=2.5, exit_z=0.2, not
     df['a_shares'] = 0.0
     df['b_shares'] = 0.0
 
-    # 根據當前部位計算每檔股票的股數，假設每次進場以 notional 的一半槓桿
+    # 根據當前部位計算每檔股票的股數
+    # A 股數量 = total capital / (A_price + beta * B_price)
+    # B 股數量 = beta * A_shares（做空時加負號）
     current_a = 0.0
     current_b = 0.0
     for idx, row in df.iterrows():
         if row['position'] == 1:
-            if current_a == 0 and current_b == 0:
-                current_a = (notional / 2) / row['A']
-                current_b = -(notional / 2) / row['B']
+            base_shares = notional / (row['A'] + row['beta'] * row['B'])
+            current_a = base_shares
+            current_b = -row['beta'] * base_shares
         elif row['position'] == -1:
-            if current_a == 0 and current_b == 0:
-                current_a = -(notional / 2) / row['A']
-                current_b = (notional / 2) / row['B']
+            base_shares = notional / (row['A'] + row['beta'] * row['B'])
+            current_a = -base_shares
+            current_b = row['beta'] * base_shares
         else:
             current_a = 0.0
             current_b = 0.0
@@ -85,8 +88,11 @@ def run_pair_trading(prices_a, prices_b, window=20, entry_z=2.5, exit_z=0.2, not
         df.at[idx, 'b_shares'] = current_b
 
     # 計算部位價值與策略每日報酬
-    df['position_value'] = df['a_shares'] * df['A'] + df['b_shares'] * df['B']
-    df['strategy_returns'] = df['position_value'].diff().fillna(0) / notional
+    # 利用昨天的持股股數 (shift(1)) 乘以今天的價格變動 (diff())
+    df['daily_pnl'] = df['a_shares'].shift(1) * df['A'].diff() + df['b_shares'].shift(1) * df['B'].diff()
+    
+    # 每日報酬率 = 每日損益 / 初始總資金
+    df['strategy_returns'] = df['daily_pnl'].fillna(0) / notional
     df['strategy_value'] = (1 + df['strategy_returns']).cumprod() * notional
     return df.dropna()
 
@@ -121,8 +127,8 @@ def performance_metrics(returns):
     }
 
 # 定期定額 (DCA) 策略：每月月底分批平均買進兩檔股票
-# 這裡將每月 10,000 USD 均分成 KO 與 PEP
-def dca_strategy(prices_a, prices_b, monthly_contribution=10_000):
+# 這裡將每月 1,000 USD 均分成 KO 與 PEP
+def dca_strategy(prices_a, prices_b, monthly_contribution=1_000):
     df = pd.DataFrame({'A': prices_a, 'B': prices_b})
     month_ends = df.resample('ME').last().index
     a_shares = 0.0
@@ -166,8 +172,39 @@ def find_best_params(prices_a, prices_b, beta):
 # 時序驗證：使用擴展訓練期 + 未見測試期的驗證方法
 # 先用 Year 1 訓練並測試 Year 2...n，再用 Years 1-2 訓練並測試 Years 3...n，以此類推
 # 重要的是：beta 必須在訓練期內估計，測試期則直接套用該 beta 計算 Spread 與 Z-score
+def _annualized_lump_sum_irr(value_series, initial_value):
+    """計算單次投資的年化IRR。value_series應為Series（帶時間索引）。"""
+    if len(value_series) < 2 or initial_value <= 0:
+        return np.nan
+    final_value = float(value_series.iloc[-1])
+    if final_value <= 0:
+        return np.nan
+    days = (value_series.index[-1] - value_series.index[0]).days
+    years = days / 365.25
+    if years <= 0:
+        return np.nan
+    return (final_value / initial_value) ** (1 / years) - 1
+
+
+def _compute_dca_annual_irr(prices_a, prices_b, monthly_contribution=1_000):
+    value = dca_strategy(prices_a, prices_b, monthly_contribution=monthly_contribution)
+    monthly_values = value.resample('ME').last()
+    cashflows = [-monthly_contribution] * len(monthly_values)
+    if not cashflows:
+        return np.nan
+    # 最後一個月的現金流 = -投資 + 月底投資組合價值
+    cashflows[-1] += monthly_values.iloc[-1]
+    irr_monthly = npf.irr(cashflows)
+    if np.isnan(irr_monthly):
+        return np.nan
+    return (1 + irr_monthly) ** 12 - 1
+
+
 def rolling_temporal_validation(df):
     years = sorted(df.index.year.unique())
+    # Exclude incomplete year (2026 only has data up to May 15)
+    years = [y for y in years if y < 2026]
+    
     validation_results = []
 
     for i in range(1, len(years)):
@@ -190,6 +227,13 @@ def rolling_temporal_validation(df):
         test_result = run_pair_trading(test_df['KO'], test_df['PEP'], beta=beta, **best_params)
         test_metrics = performance_metrics(test_result['strategy_returns'])
 
+        test_bh_shares_ko = 10_000 / 2 / test_df['KO'].iloc[0]
+        test_bh_shares_pep = 10_000 / 2 / test_df['PEP'].iloc[0]
+        test_bh_value = test_bh_shares_ko * test_df['KO'] + test_bh_shares_pep * test_df['PEP']
+        test_bh_irr = _annualized_lump_sum_irr(test_bh_value, 10_000)
+
+        test_dca_irr = _compute_dca_annual_irr(test_df['KO'], test_df['PEP'], monthly_contribution=1_000)
+
         validation_results.append({
             'Train Years': f"{train_years[0]}-{train_years[-1]}",
             'Test Years': f"{test_years[0]}-{test_years[-1]}",
@@ -207,23 +251,109 @@ def rolling_temporal_validation(df):
             'Test Sharpe': test_metrics['Sharpe Ratio'],
             'Test Cumulative Return': test_metrics['Cumulative Return'],
             'Test Max Drawdown': test_metrics['Max Drawdown'],
+            'Test IRR Pairs Trading': _annualized_lump_sum_irr(test_result['strategy_value'], 10_000),
+            'Test IRR Buy and Hold': test_bh_irr,
+            'Test IRR DCA': test_dca_irr,
         })
 
     return pd.DataFrame(validation_results)
 
 
-# 自訂每月 IRR 計算函數（備援用），目前實際並未在 main 中使用
-# 這個函數可用於計算現金流的月度內部收益率
-def monthly_irr(cashflows):
-    cashflows = np.array(cashflows, dtype=float)
-    coeffs = cashflows[::-1]
-    roots = np.roots(coeffs)
-    real_roots = np.real(roots[np.isreal(roots)])
-    positive_roots = real_roots[real_roots > 0]
-    if len(positive_roots) == 0:
-        return np.nan
-    x = positive_roots[np.argmin(np.abs(positive_roots - 1))]
-    return x - 1
+def plot_temporal_validation(validation_df, out_filepath='temporal_validation.png'):
+    """Plot temporal validation results in 2x2 panels similar to reference.
+
+    Panels:
+    - Test Cumulative Return (%)
+    - Test Annualized Return (%)
+    - Test Max Drawdown (%)
+    - Test Volatility (%)
+    """
+    if validation_df.empty:
+        print('No validation results to plot.')
+        return
+
+    # x labels: use Test Years for each validation window
+    labels = validation_df['Test Years'].astype(str).tolist()
+    x = list(range(len(labels)))
+
+    cum = validation_df['Test Cumulative Return'] * 100
+    ann = validation_df['Test Annualized Return'] * 100
+    mdd = validation_df['Test Max Drawdown'] * 100
+    vol = validation_df['Test Volatility'] * 100
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle('Temporal Validation Results', fontsize=16)
+
+    ax = axes[0, 0]
+    ax.plot(x, cum, marker='o', linestyle='-', color='tab:blue')
+    ax.set_title('Test Cumulative Return (%)')
+    ax.set_ylabel('Cumulative Return (%)')
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    ax = axes[0, 1]
+    ax.plot(x, ann, marker='s', linestyle='-', color='tab:orange')
+    ax.set_title('Test Annualized Return (%)')
+    ax.set_ylabel('Annualized Return (%)')
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    ax = axes[1, 0]
+    ax.plot(x, mdd, marker='d', linestyle='-', color='tab:green')
+    ax.set_title('Test Maximum Drawdown (%)')
+    ax.set_ylabel('Max Drawdown (%)')
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    ax = axes[1, 1]
+    ax.plot(x, vol, marker='^', linestyle='-', color='tab:red')
+    ax.set_title('Test Volatility (%)')
+    ax.set_ylabel('Volatility (%)')
+    ax.grid(True, linestyle='--', alpha=0.5)
+
+    # X ticks
+    for a in axes.flatten():
+        a.set_xticks(x)
+        a.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(out_filepath, dpi=150)
+    plt.close(fig)
+    print(f'Temporal validation plot saved to {out_filepath}')
+
+
+def plot_irr_comparison(validation_df, out_filepath='temporal_validation_irr.png'):
+    """Plot IRR comparison across test periods for Pairs Trading, B&H, and DCA using line chart."""
+    if validation_df.empty:
+        print('No validation results to plot IRR.')
+        return
+
+    labels = validation_df['Test Years'].astype(str).tolist()
+    x = list(range(len(labels)))
+    pt_irr = validation_df['Test IRR Pairs Trading'] * 100
+    bh_irr = validation_df['Test IRR Buy and Hold'] * 100
+    dca_irr = validation_df['Test IRR DCA'] * 100
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
+    ax.plot(x, pt_irr, marker='o', linestyle='-', linewidth=2, markersize=6, 
+            color='tab:blue', label='Pairs Trading')
+    ax.plot(x, bh_irr, marker='s', linestyle='-', linewidth=2, markersize=6, 
+            color='tab:orange', label='Buy and Hold')
+    ax.plot(x, dca_irr, marker='^', linestyle='-', linewidth=2, markersize=6, 
+            color='tab:green', label='DCA')
+
+    ax.set_title('Test-Period Annualized IRR Comparison (%)', fontsize=14, fontweight='bold')
+    ax.set_xlabel('Test Period', fontsize=11)
+    ax.set_ylabel('Annualized IRR (%)', fontsize=11)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.axhline(0, color='black', linestyle='-', linewidth=0.8)
+    ax.legend(fontsize=11, loc='best')
+
+    plt.tight_layout()
+    plt.savefig(out_filepath, dpi=150)
+    plt.close(fig)
+    print(f'IRR comparison plot saved to {out_filepath}')
+
 
 # 印出策略績效指標的輔助函數
 # 支援百分比與數值格式化輸出，方便快速檢視
@@ -313,33 +443,37 @@ def main():
     print('\nRolling Temporal Validation Results:')
     if not validation_df.empty:
         print(f'Validation windows: {len(validation_df)}')
-        validation_display = validation_df[['Train Years', 'Test Years', 'Window', 'EntryZ', 'ExitZ', 'Test Annualized Return', 'Test Volatility', 'Test Sharpe', 'Test Cumulative Return', 'Test Max Drawdown']]
+        validation_display = validation_df[['Train Years', 'Test Years', 'Window', 'EntryZ', 'ExitZ', 'Test Annualized Return', 'Test Volatility', 'Test Sharpe', 'Test Cumulative Return', 'Test Max Drawdown', 'Test IRR Pairs Trading', 'Test IRR Buy and Hold', 'Test IRR DCA']]
         print(validation_display)
         validation_df.to_csv('temporal_validation_results.csv', index=False)
         print('\n時序驗證結果已輸出到 temporal_validation_results.csv')
-        avg_test = validation_df[['Test Annualized Return', 'Test Volatility', 'Test Sharpe', 'Test Cumulative Return', 'Test Max Drawdown']].mean()
+        avg_test = validation_df[['Test Annualized Return', 'Test Volatility', 'Test Sharpe', 'Test Cumulative Return', 'Test Max Drawdown', 'Test IRR Pairs Trading', 'Test IRR Buy and Hold', 'Test IRR DCA']].mean()
         print('\nAverage test-period metrics across windows:')
         for metric, value in avg_test.items():
-            if 'Return' in metric or 'Drawdown' in metric:
+            if 'Return' in metric or 'Drawdown' in metric or 'IRR' in metric:
                 print(f'{metric}: {value:.2%}')
             else:
                 print(f'{metric}: {value:.4f}')
+        # Plot temporal validation summary
+        try:
+            plot_temporal_validation(validation_df, out_filepath='temporal_validation.png')
+        except Exception as e:
+            print('Failed to plot temporal validation:', e)
+        try:
+            plot_irr_comparison(validation_df, out_filepath='temporal_validation_irr.png')
+        except Exception as e:
+            print('Failed to plot IRR comparison:', e)
     else:
         print('No temporal validation windows available.')
 
     # 繪製 z-score 交易信號圖並儲存成檔案
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(pair_df.index, pair_df['zscore'], label='Spread z-score')
-    ax.axhline(2.5, color='red', linestyle='--', alpha=0.7, label='Entry threshold ±2.5')
-    ax.axhline(-2.5, color='red', linestyle='--', alpha=0.7)
-    ax.axhline(0.2, color='orange', linestyle='--', alpha=0.7, label='Exit threshold ±0.2')
-    ax.axhline(-0.2, color='orange', linestyle='--', alpha=0.7)
     ax.set_title('Pairs Trading Spread z-score')
     ax.set_ylabel('Z-score')
     ax.legend()
     plt.tight_layout()
     plt.savefig('Figure_zscore.png', dpi=100)
-    plt.show()
 
 
 if __name__ == '__main__':
