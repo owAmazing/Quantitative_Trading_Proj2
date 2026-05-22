@@ -5,8 +5,6 @@ import matplotlib.pyplot as plt
 import statsmodels.api as sm
 
 
-# 讀取 KO 與 PEP 的歷史收盤價資料，並對齊共同交易日
-# 返回單一 DataFrame，索引為交易日期，包含 KO 與 PEP 收盤價
 def load_data():
     ko = pd.read_csv('KO_20y.csv', parse_dates=['Date'])
     pep = pd.read_csv('PEP_20y.csv', parse_dates=['Date'])
@@ -30,75 +28,87 @@ def compute_spread(prices_y, prices_x, beta):
 
 
 def run_pair_trading(prices_a, prices_b, window=20, entry_z=2.5, exit_z=0.2, notional=10_000, beta=None):
-    # 建立 A/B 兩支股票價格資料表
     df = pd.DataFrame({'A': prices_a, 'B': prices_b})
 
-    # 計算 hedge ratio beta，如果未給定就用全資料 OLS 計算
     if beta is None:
         beta = estimate_hedge_ratio(df['A'], df['B'])
     df['beta'] = beta
 
-    # 依照訓練期 beta 計算價差：KO - beta * PEP
     df['spread'] = compute_spread(df['A'], df['B'], beta)
-
-    # 使用滾動視窗計算 spread 的平均與標準差
     df['spread_mean'] = df['spread'].rolling(window).mean()
     df['spread_std'] = df['spread'].rolling(window).std()
 
-    # z-score = (spread - mean) / std，用於進出場訊號
     df['zscore'] = (df['spread'] - df['spread_mean']) / df['spread_std']
     df['zscore'] = df['zscore'].fillna(0)
 
-    # 建立交易部位：0 = 空倉, 1 = long A short B, -1 = short A long B
-    position = 0
-    positions = []
+    # 1. 訊號生成：當天收盤決定訊號，隔天(t+1)才執行
+    target_position = 0
+    target_positions = []
     for z in df['zscore']:
-        if position == 0:
+        if target_position == 0:
             if z > entry_z:
-                position = -1
+                target_position = -1
             elif z < -entry_z:
-                position = 1
+                target_position = 1
         elif abs(z) < exit_z:
-            position = 0
-        positions.append(position)
+            target_position = 0
+        target_positions.append(target_position)
+    
+    # 將訊號 shift(1)，代表今天交易開盤/執行的部位是基於昨天的訊號
+    df['position'] = pd.Series(target_positions, index=df.index).shift(1).fillna(0).astype(int)
 
-    df['position'] = positions
     df['a_shares'] = 0.0
     df['b_shares'] = 0.0
 
-    # 根據當前部位計算每檔股票的股數
-    # A 股數量 = total capital / (A_price + beta * B_price)
-    # B 股數量 = beta * A_shares（做空時加負號）
     current_a = 0.0
     current_b = 0.0
+    in_position = False
+
+    # 2. 股數計算：只有在進場那一刻決定股數，持倉期間保持不變
+    # 這裡使用昨天的收盤價作為 t 日執行的基準價格
+    price_a_prev = df['A'].shift(1)
+    price_b_prev = df['B'].shift(1)
+
     for idx, row in df.iterrows():
-        if row['position'] == 1:
-            base_shares = notional / (row['A'] + row['beta'] * row['B'])
-            current_a = base_shares
-            current_b = -row['beta'] * base_shares
-        elif row['position'] == -1:
-            base_shares = notional / (row['A'] + row['beta'] * row['B'])
-            current_a = -base_shares
-            current_b = row['beta'] * base_shares
+        pos = row['position']
+        p_a = price_a_prev.at[idx]
+        p_b = price_b_prev.at[idx]
+        beta_val = row['beta']
+
+        if pos != 0:
+            if not in_position:
+                # 剛進場，計算固定股數
+                if pd.isna(p_a) or pd.isna(p_b):
+                    current_a, current_b = 0.0, 0.0
+                else:
+                    base_shares = notional / (p_a + beta_val * p_b)
+                    if pos == 1:
+                        current_a = base_shares
+                        current_b = -beta_val * base_shares
+                    else:
+                        current_a = -base_shares
+                        current_b = beta_val * base_shares
+                in_position = True
+            # if in_position == True 且 pos 未變，則 current_a, current_b 沿用，不重新計算
         else:
             current_a = 0.0
             current_b = 0.0
+            in_position = False
 
         df.at[idx, 'a_shares'] = current_a
         df.at[idx, 'b_shares'] = current_b
 
-    # 計算部位價值與策略每日報酬
-    # 利用昨天的持股股數 (shift(1)) 乘以今天的價格變動 (diff())
-    df['daily_pnl'] = df['a_shares'].shift(1) * df['A'].diff() + df['b_shares'].shift(1) * df['B'].diff()
+    # 3. 損益計算：t 日的損益 = t-1 日留下來的持股 * (t 日收盤價 - t-1 日收盤價)
+    df['daily_pnl'] = df['a_shares'] * df['A'].diff() + df['b_shares'] * df['B'].diff()
+    df['daily_pnl'] = df['daily_pnl'].fillna(0)
     
-    # 每日報酬率 = 每日損益 / 初始總資金
-    df['strategy_returns'] = df['daily_pnl'].fillna(0) / notional
-    df['strategy_value'] = (1 + df['strategy_returns']).cumprod() * notional
+    # 修正回測資產淨值曲線 (不採用單純複利，而是淨值累加，避免股數未隨淨值調整的矛盾)
+    df['strategy_value'] = notional + df['daily_pnl'].cumsum()
+    df['strategy_returns'] = df['daily_pnl'] / notional # 單利型報酬率，用於配合固定本金回測
+    
     return df.dropna()
 
 
-# 計算策略績效指標，輸入為每日報酬序列
-# 回傳年化報酬、年化波動、Sharpe ratio、累積報酬、最大回撤與最後資產值
 def performance_metrics(returns):
     returns = returns.dropna()
     if len(returns) == 0:
@@ -110,11 +120,13 @@ def performance_metrics(returns):
             'Max Drawdown': np.nan,
             'Final Wealth': np.nan,
         }
-    ann_ret = (1 + returns).prod() ** (252 / len(returns)) - 1
+    # 改用單利累積法對應固定本金策略
+    cum_ret = returns.sum()
+    ann_ret = cum_ret * (252 / len(returns))
     ann_vol = returns.std() * np.sqrt(252)
     sharpe = ann_ret / ann_vol if ann_vol != 0 else np.nan
-    cum_ret = (1 + returns).prod() - 1
-    wealth = (1 + returns).cumprod()
+    
+    wealth = 1 + returns.cumsum()
     drawdown = wealth / wealth.cummax() - 1
     max_dd = drawdown.min()
     return {
@@ -123,28 +135,70 @@ def performance_metrics(returns):
         'Sharpe Ratio': sharpe,
         'Cumulative Return': cum_ret,
         'Max Drawdown': max_dd,
-        'Final Wealth': wealth.iloc[-1],
+        'Final Wealth': wealth.iloc[-1] * 10000, # 僅供參考
     }
 
-# 定期定額 (DCA) 策略：每月月底分批平均買進兩檔股票
-# 這裡將每月 1,000 USD 均分成 KO 與 PEP
+
 def dca_strategy(prices_a, prices_b, monthly_contribution=1_000):
     df = pd.DataFrame({'A': prices_a, 'B': prices_b})
     month_ends = df.resample('ME').last().index
     a_shares = 0.0
     b_shares = 0.0
     value = []
+    
+    # 修正 DCA 每日真報酬率計算（排除入金干擾）
+    daily_returns = [0.0]
+    prev_val = 0.0
+    
     for date, row in df.iterrows():
+        current_val = a_shares * row['A'] + b_shares * row['B']
+        
+        if len(value) > 0:
+            # 當天開盤前的價值就是昨天的價值，計算純因價格變動引起的報酬率
+            if prev_val > 0:
+                ret = (current_val - prev_val) / prev_val
+            else:
+                ret = 0.0
+            daily_returns.append(ret)
+            
         if date in month_ends:
             a_shares += monthly_contribution / 2 / row['A']
             b_shares += monthly_contribution / 2 / row['B']
-        value.append(a_shares * row['A'] + b_shares * row['B'])
-    return pd.Series(value, index=df.index)
+            # 更新投入後的真實市值
+            current_val = a_shares * row['A'] + b_shares * row['B']
+            
+        value.append(current_val)
+        prev_val = current_val
+        
+    return pd.Series(value, index=df.index), pd.Series(daily_returns, index=df.index)
 
 
-# 參數網格搜尋：在訓練資料上選出表現最好的 entry/exit z-score 與 rolling window 組合
-# 這個函數會回傳最佳參數組合，評估指標為年化報酬
-# 訓練期內只用相同參數搜尋最佳值，測試期保持參數不變
+def _annualized_lump_sum_irr(value_series, initial_value):
+    if len(value_series) < 2 or initial_value <= 0:
+        return np.nan
+    final_value = float(value_series.iloc[-1])
+    if final_value <= 0:
+        return np.nan
+    days = (value_series.index[-1] - value_series.index[0]).days
+    years = days / 365.25
+    if years <= 0:
+        return np.nan
+    return (final_value / initial_value) ** (1 / years) - 1
+
+
+def _compute_dca_annual_irr(prices_a, prices_b, monthly_contribution=1_000):
+    value, _ = dca_strategy(prices_a, prices_b, monthly_contribution=monthly_contribution)
+    monthly_values = value.resample('ME').last()
+    cashflows = [-monthly_contribution] * len(monthly_values)
+    if not cashflows:
+        return np.nan
+    cashflows[-1] += monthly_values.iloc[-1]
+    irr_monthly = npf.irr(cashflows)
+    if np.isnan(irr_monthly):
+        return np.nan
+    return (1 + irr_monthly) ** 12 - 1
+
+
 def find_best_params(prices_a, prices_b, beta):
     best_score = -np.inf
     best_params = {'window': 60, 'entry_z': 2, 'exit_z': 0.2}
@@ -169,40 +223,8 @@ def find_best_params(prices_a, prices_b, beta):
     return best_params
 
 
-# 時序驗證：使用擴展訓練期 + 未見測試期的驗證方法
-# 先用 Year 1 訓練並測試 Year 2...n，再用 Years 1-2 訓練並測試 Years 3...n，以此類推
-# 重要的是：beta 必須在訓練期內估計，測試期則直接套用該 beta 計算 Spread 與 Z-score
-def _annualized_lump_sum_irr(value_series, initial_value):
-    """計算單次投資的年化IRR。value_series應為Series（帶時間索引）。"""
-    if len(value_series) < 2 or initial_value <= 0:
-        return np.nan
-    final_value = float(value_series.iloc[-1])
-    if final_value <= 0:
-        return np.nan
-    days = (value_series.index[-1] - value_series.index[0]).days
-    years = days / 365.25
-    if years <= 0:
-        return np.nan
-    return (final_value / initial_value) ** (1 / years) - 1
-
-
-def _compute_dca_annual_irr(prices_a, prices_b, monthly_contribution=1_000):
-    value = dca_strategy(prices_a, prices_b, monthly_contribution=monthly_contribution)
-    monthly_values = value.resample('ME').last()
-    cashflows = [-monthly_contribution] * len(monthly_values)
-    if not cashflows:
-        return np.nan
-    # 最後一個月的現金流 = -投資 + 月底投資組合價值
-    cashflows[-1] += monthly_values.iloc[-1]
-    irr_monthly = npf.irr(cashflows)
-    if np.isnan(irr_monthly):
-        return np.nan
-    return (1 + irr_monthly) ** 12 - 1
-
-
 def rolling_temporal_validation(df):
     years = sorted(df.index.year.unique())
-    # Exclude incomplete year (2026 only has data up to May 15)
     years = [y for y in years if y < 2026]
     
     validation_results = []
@@ -260,19 +282,10 @@ def rolling_temporal_validation(df):
 
 
 def plot_temporal_validation(validation_df, out_filepath='temporal_validation.png'):
-    """Plot temporal validation results in 2x2 panels similar to reference.
-
-    Panels:
-    - Test Cumulative Return (%)
-    - Test Annualized Return (%)
-    - Test Max Drawdown (%)
-    - Test Volatility (%)
-    """
     if validation_df.empty:
         print('No validation results to plot.')
         return
 
-    # x labels: use Test Years for each validation window
     labels = validation_df['Test Years'].astype(str).tolist()
     x = list(range(len(labels)))
 
@@ -308,7 +321,6 @@ def plot_temporal_validation(validation_df, out_filepath='temporal_validation.pn
     ax.set_ylabel('Volatility (%)')
     ax.grid(True, linestyle='--', alpha=0.5)
 
-    # X ticks
     for a in axes.flatten():
         a.set_xticks(x)
         a.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
@@ -320,7 +332,6 @@ def plot_temporal_validation(validation_df, out_filepath='temporal_validation.pn
 
 
 def plot_irr_comparison(validation_df, out_filepath='temporal_validation_irr.png'):
-    """Plot IRR comparison across test periods for Pairs Trading, B&H, and DCA using line chart."""
     if validation_df.empty:
         print('No validation results to plot IRR.')
         return
@@ -355,8 +366,6 @@ def plot_irr_comparison(validation_df, out_filepath='temporal_validation_irr.png
     print(f'IRR comparison plot saved to {out_filepath}')
 
 
-# 印出策略績效指標的輔助函數
-# 支援百分比與數值格式化輸出，方便快速檢視
 def print_metrics(name, metrics):
     print(f"=== {name} ===")
     for k, v in metrics.items():
@@ -371,63 +380,48 @@ def print_metrics(name, metrics):
 
 
 def main():
-    # 讀取資料並顯示日期範圍與前幾筆資料
     df = load_data()
     print('資料範圍：', df.index.min().date(), '到', df.index.max().date())
-    print(df.head())
 
-    # 初始資本
     initial_capital = 10_000
 
-    # Pairs trading 策略回測
     pair_df = run_pair_trading(df['KO'], df['PEP'], notional=initial_capital)
     pair_metrics = performance_metrics(pair_df['strategy_returns'])
 
-    # Buy-and-hold 策略：等權分配初始資金
     bh_shares_ko = initial_capital / 2 / df['KO'].iloc[0]
     bh_shares_pep = initial_capital / 2 / df['PEP'].iloc[0]
     bh_value = bh_shares_ko * df['KO'] + bh_shares_pep * df['PEP']
     bh_returns = bh_value.pct_change().fillna(0)
     bh_metrics = performance_metrics(bh_returns)
 
-    # DCA 策略：每月固定投資金額
-    dca_value = dca_strategy(df['KO'], df['PEP'], monthly_contribution=1_000)
-    dca_perf = performance_metrics(dca_value.pct_change().fillna(0))
+    dca_value, dca_daily_rets = dca_strategy(df['KO'], df['PEP'], monthly_contribution=1_000)
+    dca_perf = performance_metrics(dca_daily_rets)
     total_contributions = 1_000 * len(dca_value.resample('ME'))
     dca_simple_return = dca_value.iloc[-1] / total_contributions - 1
+    
     dca_cashflows = [-1_000] * (len(dca_value.resample('ME')) - 1) + [-1_000 + dca_value.iloc[-1]]
     dca_monthly_irr = npf.irr(dca_cashflows)
     dca_annual_irr = (1 + dca_monthly_irr) ** 12 - 1 if not np.isnan(dca_monthly_irr) else np.nan
+    
     dca_metrics = {
-        'Annualized Return': dca_annual_irr,
+        'Annualized Return': dca_annual_irr, # 對於定期定額，IRR 較適合作為年化報酬率標準
         'Annualized Volatility': dca_perf['Annualized Volatility'],
-        'Sharpe Ratio': dca_perf['Sharpe Ratio'],
+        'Sharpe Ratio': dca_annual_irr / dca_perf['Annualized Volatility'] if dca_perf['Annualized Volatility'] != 0 else np.nan,
         'Cumulative Return': dca_simple_return,
         'Max Drawdown': dca_perf['Max Drawdown'],
         'Final Wealth': dca_value.iloc[-1],
     }
 
-    # 印出三種策略的主要績效
     print_metrics('Pairs Trading', pair_metrics)
-    print(f'Total contributions: ${initial_capital:,.0f}')
-    print(f'Final portfolio value: ${pair_df["strategy_value"].iloc[-1]:,.0f}')
-    print(f'Simple cumulative return after contributions: {(pair_df["strategy_value"].iloc[-1] / initial_capital - 1):.2%}')
-    print(f'Approximate annual IRR: {pair_metrics["Annualized Return"]:.2%}')
-    print()
+    print(f'Final portfolio value: ${pair_df["strategy_value"].iloc[-1]:,.0f}\n')
+    
     print_metrics('Buy and Hold', bh_metrics)
-    print(f'Total contributions: ${initial_capital:,.0f}')
-    print(f'Final portfolio value: ${bh_value.iloc[-1]:,.0f}')
-    print(f'Simple cumulative return after contributions: {(bh_value.iloc[-1] / initial_capital - 1):.2%}')
-    print(f'Approximate annual IRR: {bh_metrics["Annualized Return"]:.2%}')
-    print()
+    print(f'Final portfolio value: ${bh_value.iloc[-1]:,.0f}\n')
+    
     print_metrics('DCA', dca_metrics)
     print(f'Total contributions: ${total_contributions:,.0f}')
-    print(f'Final portfolio value: ${dca_value.iloc[-1]:,.0f}')
-    print(f'Simple cumulative return after contributions: {dca_simple_return:.2%}')
-    print(f'Approximate annual IRR: {dca_annual_irr:.2%}')
-    print()
+    print(f'Final portfolio value: ${dca_value.iloc[-1]:,.0f}\n')
 
-    # 比較 Pairs Trading、Buy-and-Hold 與 DCA 的核心績效指標
     metrics_df = pd.DataFrame({
         'Pairs Trading': pair_metrics,
         'Buy and Hold': bh_metrics,
@@ -436,17 +430,10 @@ def main():
     comparison_table = metrics_df[['Annualized Return', 'Annualized Volatility', 'Sharpe Ratio', 'Cumulative Return', 'Max Drawdown']]
     print(comparison_table)
     comparison_table.to_csv('strategy_comparison.csv')
-    print('\n策略比較已輸出到 strategy_comparison.csv')
 
-    # Rolling temporal validation：使用滾雪球式訓練/測試視窗逐步擴展訓練期
     validation_df = rolling_temporal_validation(df)
-    print('\nRolling Temporal Validation Results:')
     if not validation_df.empty:
-        print(f'Validation windows: {len(validation_df)}')
-        validation_display = validation_df[['Train Years', 'Test Years', 'Window', 'EntryZ', 'ExitZ', 'Test Annualized Return', 'Test Volatility', 'Test Sharpe', 'Test Cumulative Return', 'Test Max Drawdown', 'Test IRR Pairs Trading', 'Test IRR Buy and Hold', 'Test IRR DCA']]
-        print(validation_display)
         validation_df.to_csv('temporal_validation_results.csv', index=False)
-        print('\n時序驗證結果已輸出到 temporal_validation_results.csv')
         avg_test = validation_df[['Test Annualized Return', 'Test Volatility', 'Test Sharpe', 'Test Cumulative Return', 'Test Max Drawdown', 'Test IRR Pairs Trading', 'Test IRR Buy and Hold', 'Test IRR DCA']].mean()
         print('\nAverage test-period metrics across windows:')
         for metric, value in avg_test.items():
@@ -454,7 +441,6 @@ def main():
                 print(f'{metric}: {value:.2%}')
             else:
                 print(f'{metric}: {value:.4f}')
-        # Plot temporal validation summary
         try:
             plot_temporal_validation(validation_df, out_filepath='temporal_validation.png')
         except Exception as e:
@@ -463,10 +449,7 @@ def main():
             plot_irr_comparison(validation_df, out_filepath='temporal_validation_irr.png')
         except Exception as e:
             print('Failed to plot IRR comparison:', e)
-    else:
-        print('No temporal validation windows available.')
 
-    # 繪製 z-score 交易信號圖並儲存成檔案
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(pair_df.index, pair_df['zscore'], label='Spread z-score')
     ax.set_title('Pairs Trading Spread z-score')
